@@ -26,3 +26,10 @@ def sign(
         )
     except (InvalidSelection, OverlappingTiles, InsufficientEvidence, sqlite3.Error) as exc:
         raise SignRejected(str(exc)) from exc
+
+
+def sign_revisit(db, old_report_id: int, new_report_id: int, originals: Iterable[bytes]):
+    # Imported lazily so the V1 module graph stays unchanged for existing callers.
+    from review.revisit_finalize import sign_revisit as _sign_revisit
+
+    return _sign_revisit(db, old_report_id, new_report_id, originals)

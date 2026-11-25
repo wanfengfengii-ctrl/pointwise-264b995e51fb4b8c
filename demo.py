@@ -4,12 +4,12 @@ from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from issue.publish import publish
+from issue.publish import publish, publish_comparison
 from quality.tile_review import inspect
 from receipt.accept import accept
 from receipt.store import ReceiptStore
-from review.archive import read
-from review.finalize import sign
+from review.archive import read, read_revisit
+from review.finalize import sign, sign_revisit
 from review.report_store import ReportStore
 from samples import EAST_INITIAL, ROUND, SHIFT, WEST_CORRECTION, WEST_INITIAL
 from survey.bootstrap import initialize_survey
@@ -103,5 +103,72 @@ def main():
         ])
 
 
+def revisit_demo():
+    """Close every source station, then sign revisit checklists from bytes alone."""
+    from revisit_samples import prepare
+
+    with TemporaryDirectory(prefix='qingcha-revisit-') as temporary:
+        directory = Path(temporary)
+        center_path = directory / 'center.sqlite3'
+        west_path = directory / 'west.sqlite3'
+        east_path = directory / 'east.sqlite3'
+        with closing(sqlite3.connect(center_path)) as center:
+            ReceiptStore(center).ensure_schema()
+            ReportStore(center).ensure_schema()
+            with closing(sqlite3.connect(west_path)) as west, closing(sqlite3.connect(east_path)) as east:
+                reports, issues = prepare(center, {'west': west, 'east': east}, 'seam')
+                kept = []
+                split_comparisons = []
+                for tile, station in (('west', west), ('east', east)):
+                    kept.append(publish_comparison(
+                        station, issues['old', tile][0], issues['kept', tile][0]
+                    )[1])
+                    split_comparisons.append(publish_comparison(
+                        station, issues['old', tile][0], issues['split', tile][0]
+                    )[1])
+            # Both stations are now closed; the center only holds the delivered bytes.
+            sealed = []
+            for new_label, comparisons in (('kept', kept), ('split', split_comparisons)):
+                revisit_id, checklist, origins = sign_revisit(
+                    center, reports['old'], reports[new_label], comparisons
+                )
+                sealed.append((revisit_id, new_label, checklist, origins))
+                record = {
+                    'case_id': f'revisit_old_to_{new_label}',
+                    'old_report': reports['old'],
+                    'new_report': reports[new_label],
+                    'old_regions': list(checklist['old_regions']),
+                    'new_regions': list(checklist['new_regions']),
+                    'exited': list(checklist['exited']),
+                    'added': list(checklist['added']),
+                    'overlaps': [
+                        [list(edge[0]), list(edge[1]), edge[2], list(edge[3])]
+                        for edge in checklist['overlaps']
+                    ],
+                    'sources': [
+                        [old_issue, new_issue, comparison_id]
+                        for old_issue, new_issue, comparison_id, _original in origins['comparisons']
+                    ],
+                    'oracle': '关原站仅凭对照原件签发；分裂边按旧区多边、合并边按新区多边判定',
+                }
+                print('POINTWISE_REVISIT ' + json.dumps(record, ensure_ascii=False, sort_keys=True))
+
+        # Reopen the center and collect every checklist by its id.
+        with closing(sqlite3.connect(center_path)) as reopened:
+            for revisit_id, new_label, checklist, origins in sealed:
+                fetched = read_revisit(reopened, revisit_id)
+                if fetched != (revisit_id, checklist, origins):
+                    raise RuntimeError(f'revisit {revisit_id} changed after the center reopened')
+                # The V1 reports and their first receipts stay available as before.
+                read(reopened, reports['old'])
+                read(reopened, reports[new_label])
+            print('POINTWISE_REVISIT ' + json.dumps({
+                'case_id': 'reopen_collection',
+                'revisit_ids': [revisit_id for revisit_id, _l, _c, _o in sealed],
+                'result': 'all checklists, V1 reports and comparison origins retrieved by id',
+            }, ensure_ascii=False, sort_keys=True))
+
+
 if __name__ == '__main__':
     main()
+    revisit_demo()

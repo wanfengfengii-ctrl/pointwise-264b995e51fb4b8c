@@ -6,11 +6,11 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from issue.envelope import decode_v1
-from issue.publish import publish
+from issue.publish import publish, publish_comparison
 from receipt.accept import accept
 from receipt.store import ReceiptStore
-from review.archive import read
-from review.finalize import sign
+from review.archive import read, read_revisit
+from review.finalize import sign, sign_revisit
 from review.report_store import ReportStore
 from survey.bootstrap import initialize_survey
 from survey.grid import GridBounds
@@ -95,6 +95,96 @@ def check_scene(name, directory=None):
     print(json.dumps({"scene": name, "v1_counts": counts}, sort_keys=True))
 
 
+REVISIT_EXPECTATIONS = {
+    "move": {
+        ("old", "kept"): {
+            "old_regions": ((2, 2),), "new_regions": ((2, 2),),
+            "exited": (), "added": (),
+            "overlaps": (((2, 2), (2, 2), 1, ("continue",)),),
+        },
+        ("old", "moved"): {
+            "old_regions": ((2, 2),), "new_regions": ((6, 2),),
+            "exited": ((2, 2),), "added": ((6, 2),), "overlaps": (),
+        },
+    },
+    "seam": {
+        ("old", "kept"): {
+            "overlaps": (((2, 2), (2, 2), 18, ("continue",)),),
+        },
+        ("old", "split"): {
+            "overlaps": (
+                ((2, 2), (2, 2), 6, ("split",)),
+                ((2, 2), (5, 2), 9, ("split",)),
+            ),
+        },
+        ("split", "old"): {
+            "overlaps": (
+                ((2, 2), (2, 2), 6, ("merge",)),
+                ((5, 2), (2, 2), 9, ("merge",)),
+            ),
+        },
+        ("old", "opened"): {
+            "old_regions": ((2, 2),), "new_regions": (),
+            "exited": ((2, 2),), "added": (), "overlaps": (),
+        },
+        ("split", "horizontal"): {
+            "overlaps": (
+                ((2, 2), (2, 2), 2, ("split", "merge")),
+                ((2, 2), (2, 4), 2, ("split", "merge")),
+                ((5, 2), (2, 2), 3, ("split", "merge")),
+                ((5, 2), (2, 4), 3, ("split", "merge")),
+            ),
+        },
+    },
+}
+
+
+def check_revisit(name, directory=None):
+    """Publish comparisons from the stations, then sign checklists at the center."""
+    def connect(role):
+        path = ":memory:" if directory is None else directory / f"revisit-{name}-{role}.sqlite3"
+        return sqlite3.connect(path)
+
+    boxes, _ = scene(name)
+    with closing(connect("center")) as center:
+        with ExitStack() as active:
+            stations = {tile: active.enter_context(closing(connect(tile))) for tile in boxes}
+            report_ids, issues = prepare(center, stations, name)
+            sealed = {}
+            for (old_label, new_label), expected in REVISIT_EXPECTATIONS[name].items():
+                comparisons = []
+                for tile in boxes:
+                    _comparison_id, original = publish_comparison(
+                        stations[tile],
+                        issues[old_label, tile][0],
+                        issues[new_label, tile][0],
+                    )
+                    comparisons.append(original)
+                # Stations may be closed: signing only needs the center and the bytes.
+                revisit_id, checklist, origins = sign_revisit(
+                    center, report_ids[old_label], report_ids[new_label], comparisons
+                )
+                sealed[(old_label, new_label)] = (revisit_id, checklist, origins)
+                for field, value in expected.items():
+                    if checklist[field] != value:
+                        raise RuntimeError(
+                            f"revisit {name} {old_label}->{new_label} field {field!r} "
+                            f"expected {value!r} got {checklist[field]!r}"
+                        )
+                if origins["old_report_id"] != report_ids[old_label]:
+                    raise RuntimeError("revisit origins lost the old report id")
+                if origins["new_report_id"] != report_ids[new_label]:
+                    raise RuntimeError("revisit origins lost the new report id")
+                if len(origins["comparisons"]) != len(boxes):
+                    raise RuntimeError("revisit origins must list every comparison source")
+        if directory is not None:
+            with closing(connect("center")) as reopened:
+                for key, triple in sealed.items():
+                    if read_revisit(reopened, triple[0]) != triple:
+                        raise RuntimeError(f"revisit {key!r} changed on center reopen")
+    print(json.dumps({"scene": name, "revisit_checks": sorted(map("->".join, sealed))}, sort_keys=True))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Prepare and check the V1 inputs for the revisit examples")
     parser.add_argument("--disk", action="store_true", help="use separate temporary databases and reopen the center")
@@ -103,9 +193,11 @@ def main():
         with TemporaryDirectory(prefix="revisit-sample-") as temporary:
             for name in ("move", "seam"):
                 check_scene(name, Path(temporary))
+                check_revisit(name, Path(temporary))
     else:
         for name in ("move", "seam"):
             check_scene(name)
+            check_revisit(name)
 
 
 if __name__ == "__main__":
